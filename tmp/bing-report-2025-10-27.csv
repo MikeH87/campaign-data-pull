@@ -1,0 +1,15 @@
+﻿"Report Name: CampaignPerf 2025-10-27"
+"Report Time: 10/27/2025"
+"Time Zone: (GMT) Greenwich Mean Time : Dublin, Edinburgh, Lisbon, London"
+"Last Completed Available Day: 10/28/2025 6:40:00 PM (GMT)"
+"Last Completed Available Hour: 10/28/2025 6:40:00 PM (GMT)"
+"Report Aggregation: Daily"
+"Report Filter: "
+"Potential Incomplete Data: true"
+"Rows: 2"
+
+"TimePeriod","AccountId","AccountName","CampaignId","CampaignName","CampaignStatus","Impressions","Clicks","AverageCpc","Spend","Conversions","AllCostPerConversion"
+"2025-10-27","149445513","TLP","381506609","SSAS-BAD-JAN-24","Active","1271","12","2.77","33.24","0",""
+"2025-10-27","149445513","TLP","675928057","FIC-BAD-MAR-24","Active","273","8","1.21","9.67","0",""
+
+"©2025 Microsoft Corporation. All rights reserved. "

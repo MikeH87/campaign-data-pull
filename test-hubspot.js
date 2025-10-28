@@ -1,10 +1,10 @@
-require("dotenv").config();
-const { syncBingToHubspot } = require("./src/syncBingToHubspot");
+const { createHubSpotClient } = require("./src/hubspotClient");
 
 (async () => {
   try {
-    const result = await syncBingToHubspot();
-    console.log("✅ Finished run:", result);
+    const hs = createHubSpotClient();
+    const resp = await hs.get("/marketing/v3/campaigns?limit=1");
+    console.log("✅ HubSpot client ok. Keys:", Object.keys(resp.data));
   } catch (e) {
     if (e.response) {
       console.error("❌ HTTP", e.response.status, e.response.statusText, e.response.data);
