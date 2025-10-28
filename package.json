@@ -1,16 +1,22 @@
 {
   "name": "campaign-data-pull",
   "version": "1.0.0",
-  "description": "",
+  "description": "Tiny Node.js app that pulls daily spend from Microsoft/Bing Ads and writes it to HubSpot Campaigns.",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node index.js"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "hubspot",
+    "bing-ads",
+    "microsoft-ads",
+    "cron",
+    "render"
+  ],
+  "author": "Mike Holt",
   "license": "ISC",
   "dependencies": {
-    "axios": "^1.13.0",
+    "axios": "^1.7.7",
     "dotenv": "^17.2.3"
   }
 }
