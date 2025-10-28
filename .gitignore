@@ -1,0 +1,24 @@
+﻿# Node.js essentials
+node_modules/
+npm-debug.log
+.env
+.env.local
+.DS_Store
+
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# System files
+Thumbs.db
+desktop.ini
+
+# IDE/editor settings
+.vscode/
+.idea/
+
+# Build and cache folders
+dist/
+build/
+.cache/
