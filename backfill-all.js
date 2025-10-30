@@ -1,6 +1,5 @@
 // File: backfill-all.js
 require('dotenv').config();
-
 const fs = require('fs');
 const path = require('path');
 
@@ -11,7 +10,6 @@ const { getDailyCampaignRows: getTwitterRows } = require('./src/twitterAdsReport
 // HubSpot
 const { getHubspotClient } = require('./src/hubspotClient');
 
-// --- Settings & helpers ---
 const MAP_PATH = process.env.CAMPAIGN_MAP_FILE || path.resolve(__dirname, 'campaign-map.json');
 
 function readJsonSafe(filePath) {
@@ -41,25 +39,19 @@ function* eachDate(fromYmd, toYmd) {
 }
 function toMajorUnits(amountFloat) {
   const n = Number(amountFloat || 0);
-  return Math.round(n * 100) / 100; // 2dp number
+  return Math.round(n * 100) / 100;
 }
 
-// idempotent, persistent ensure by name
 async function ensureCampaignIdForName(hs, name, { dryRun }) {
   const map = getCampaignMap();
   const mappedId = map[name];
-
-  if (dryRun) {
-    if (mappedId) return mappedId;
-    console.log(`[DRY] would create HubSpot campaign "${name}"`);
-    return null;
-  }
+  if (dryRun) return mappedId || null;
 
   if (mappedId) {
     try {
       await hs.getCampaignById(mappedId);
       return mappedId;
-    } catch { /* stale id, fall through */ }
+    } catch { /* stale id */ }
   }
 
   const found = await hs.findCampaignByName(name).catch(() => null);
@@ -69,81 +61,48 @@ async function ensureCampaignIdForName(hs, name, { dryRun }) {
     return found.id;
   }
 
-  const created = await hs.createCampaign(name);
+  const created = await hs.ensureCampaign(name);
   const id = created?.id;
   if (!id) throw new Error(`Create campaign did not return id for "${name}"`);
-  console.log(`Created campaign "${name}" -> ${id}`);
   map[name] = id;
   saveCampaignMap(map);
   return id;
 }
 
-function pickSourceFn(source) {
-  const s = (source || '').toLowerCase();
-  if (s === 'bing')     return { fn: getBingRows, label: 'Bing Ads' };
-  if (s === 'twitter')  return { fn: getTwitterRows, label: 'Twitter Ads' };
-  if (s === 'both' || !s) return { fn: null, label: 'Both' };
-  throw new Error(`Unknown --source=${source}`);
-}
-
 async function processDayForRows(hs, ymd, rows, { dryRun, spendSourceLabel }) {
-  if (!rows || rows.length === 0) {
-    console.log(`- ${ymd}: no data (skipped)`);
-    return { totalsAdded: 0, spendItems: 0, failures: 0 };
-  }
-
-  let totalsAdded = 0;
-  let spendItems = 0;
-  let failures = 0;
+  if (!rows || rows.length === 0) return { totalsAdded: 0, spendItems: 0, failures: 0 };
+  let totalsAdded = 0, spendItems = 0, failures = 0;
 
   for (const row of rows) {
-    const {
-      campaignName,
-      impressions,
-      clicks,
-      conversions,
-      spend,
-    } = row;
-
+    const { campaignName, impressions, clicks, conversions, spend } = row;
     const name = campaignName || row.name;
-    if (!name) {
-      console.log(`❌ Day ${ymd} row missing campaign name, skipping row.`);
-      failures++;
-      continue;
-    }
+    if (!name) continue;
 
-    // Ensure HS id
-    let campaignId = null;
+    let campaignId;
     try {
       campaignId = await ensureCampaignIdForName(hs, name, { dryRun });
     } catch (e) {
-      console.log(`❌ Ensure campaign failed for "${name}": ${e.message || e}`);
-      failures++;
-      continue;
+      console.log(`❌ Ensure campaign failed for "${name}": ${e.message}`);
+      failures++; continue;
     }
 
-    // Spend (major)
+    // Spend
     const amountMajor = toMajorUnits(spend);
     if (amountMajor > 0) {
-      if (dryRun) {
-        console.log(`[DRY] spend ${name} ${ymd} £${amountMajor.toFixed(2)}`);
-      } else {
+      if (dryRun) console.log(`[DRY] spend ${name} ${ymd} £${amountMajor.toFixed(2)}`);
+      else {
         try {
-          await hs.createSpendItem(campaignId, {
-            isoDate: ymd,
-            amountMajor,
-            source: spendSourceLabel,
-          });
+          await hs.createSpendItem(campaignId, { isoDate: ymd, amountMajor, source: spendSourceLabel });
           console.log(`💷 spend: ${name} ${ymd} £${amountMajor.toFixed(2)} (created)`);
           spendItems++;
         } catch (e) {
-          console.log(`❌ Spend item failed for "${name}": ${e.message || e}`);
+          console.log(`❌ Spend item failed for "${name}": ${e.message}`);
           failures++;
         }
       }
     }
 
-    // Totals (strictly monotonic & date-guarded)
+    // Totals (additive)
     const addClicks = Number(clicks || 0);
     const addImps = Number(impressions || 0);
     const addConvs = Number(conversions || 0);
@@ -153,21 +112,13 @@ async function processDayForRows(hs, ymd, rows, { dryRun, spendSourceLabel }) {
         console.log(`[DRY] totals ${name} +clicks ${addClicks} +imps ${addImps} +conv ${addConvs}`);
       } else {
         try {
-          const ok = await hs.addDailyTotalsMonotonic(campaignId, {
+          await hs.addDailyTotalsAccumulative(campaignId, {
             clicks: addClicks, impressions: addImps, conversions: addConvs, dateISO: ymd,
           });
-          if (ok) {
-            console.log(`✅ totals: ${name} clicks+${addClicks} imps+${addImps} conv+${addConvs}`);
-            totalsAdded++;
-          } else {
-            console.log(`↩︎ totals skipped (already processed newer date): ${name} ${ymd}`);
-          }
+          console.log(`✅ totals: ${name} clicks+${addClicks} imps+${addImps} conv+${addConvs}`);
+          totalsAdded++;
         } catch (e) {
-          if (e?.response?.data) {
-            console.log(`❌ Totals failed for "${name}": ${JSON.stringify(e.response.data, null, 2)}`);
-          } else {
-            console.log(`❌ Totals failed for "${name}": ${e.message || e}`);
-          }
+          console.log(`❌ Totals failed for "${name}": ${e.message}`);
           failures++;
         }
       }
@@ -186,66 +137,39 @@ async function processDay(hs, ymd, source, { dryRun }) {
     const rows = await getTwitterRows(ymd);
     return processDayForRows(hs, ymd, rows, { dryRun, spendSourceLabel: 'Twitter Ads' });
   }
-
-  // both
-  const bing = await getBingRows(ymd);
-  const res1 = await processDayForRows(hs, ymd, bing, { dryRun, spendSourceLabel: 'Bing Ads' });
-
-  const twitter = await getTwitterRows(ymd);
-  const res2 = await processDayForRows(hs, ymd, twitter, { dryRun, spendSourceLabel: 'Twitter Ads' });
-
-  return {
-    totalsAdded: res1.totalsAdded + res2.totalsAdded,
-    spendItems: res1.spendItems + res2.spendItems,
-    failures: res1.failures + res2.failures,
-  };
+  throw new Error(`Unknown source=${source}`);
 }
 
 async function main() {
   const args = process.argv.slice(2);
-  // --from=YYYY-MM-DD --to=YYYY-MM-DD [--source=bing|twitter|both] [--dryRun]
-  const fromArg = args.find(a => a.startsWith('--from=')) || '';
-  const toArg = args.find(a => a.startsWith('--to=')) || '';
-  const dryRun = args.some(a => a === '--dryRun');
-  const sourceArg = (args.find(a => a.startsWith('--source=')) || '').split('=')[1] || 'both';
-
-  const from = fromArg.split('=')[1];
-  const to = toArg.split('=')[1];
+  const from = (args.find(a => a.startsWith('--from=')) || '').split('=')[1];
+  const to = (args.find(a => a.startsWith('--to=')) || '').split('=')[1];
+  const dryRun = args.includes('--dryRun');
+  const sourceArg = (args.find(a => a.startsWith('--source=')) || '').split('=')[1] || 'bing';
 
   if (!from || !to) {
-    console.error('Usage: node backfill-all.js --from=YYYY-MM-DD --to=YYYY-MM-DD [--source=bing|twitter|both] [--dryRun]');
+    console.error('Usage: node backfill-all.js --from=YYYY-MM-DD --to=YYYY-MM-DD [--source=bing|twitter] [--dryRun]');
     process.exit(1);
   }
 
   const hs = getHubspotClient();
-
   console.log(`Backfill ALL (${sourceArg}) ${from} → ${to}${dryRun ? ' [DRY RUN]' : ''}`);
 
   let days = 0, totalsAdded = 0, spendItems = 0, failures = 0;
-
   for (const ymd of eachDate(from, to)) {
     try {
       const res = await processDay(hs, ymd, sourceArg, { dryRun });
-      days++;
       totalsAdded += res.totalsAdded;
       spendItems += res.spendItems;
       failures += res.failures;
+      days++;
     } catch (e) {
-      console.log(`❌ Day ${ymd} failed: ${e.stack || e.message || e}`);
+      console.log(`❌ Day ${ymd} failed: ${e.message}`);
       failures++;
     }
   }
 
-  if (dryRun) {
-    console.log(`Done. Days=${days} TotalsAdded=${totalsAdded} SpendItems=${spendItems} Skipped=0 (DRY)`);
-  } else {
-    console.log(`Done. Days=${days} TotalsAdded=${totalsAdded} SpendItems=${spendItems} Skipped=0 Failures=${failures}`);
-  }
+  console.log(`Done. Days=${days} TotalsAdded=${totalsAdded} SpendItems=${spendItems} Failures=${failures}`);
 }
 
-if (require.main === module) {
-  main().catch(e => {
-    console.error(e?.stack || e);
-    process.exit(1);
-  });
-}
+if (require.main === module) main().catch(e => { console.error(e); process.exit(1); });
