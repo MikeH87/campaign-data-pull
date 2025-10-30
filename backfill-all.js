@@ -82,17 +82,18 @@ async function ensureCampaignIdForName(hs, name, { dryRun }) {
   return id;
 }
 
-function toMinorUnits(amountFloat) {
-  // Pence (GBP) / cents: round safely
-  return Math.round(Number(amountFloat || 0) * 100);
-}
-
 function* eachDate(fromYmd, toYmd) {
   const d = new Date(`${fromYmd}T00:00:00Z`);
   const end = new Date(`${toYmd}T00:00:00Z`);
   for (let t = d; t <= end; t = new Date(t.getTime() + 86400000)) {
     yield t.toISOString().slice(0, 10);
   }
+}
+
+function toMajorUnits(amountFloat) {
+  // Ensure a Number with 2 decimal places, not a string.
+  const n = Number(amountFloat || 0);
+  return Math.round(n * 100) / 100;
 }
 
 async function processDay(hs, ymd, { dryRun }) {
@@ -132,20 +133,20 @@ async function processDay(hs, ymd, { dryRun }) {
       continue;
     }
 
-    const amountMinor = toMinorUnits(spend);
+    // ----- Spend item (MAJOR units) -----
+    const amountMajor = toMajorUnits(spend);
 
-    // Spend item
-    if (amountMinor > 0) {
+    if (amountMajor > 0) {
       if (dryRun) {
-        console.log(`[DRY] spend ${name} ${ymd} £${Number(spend).toFixed(2)}`);
+        console.log(`[DRY] spend ${name} ${ymd} £${amountMajor.toFixed(2)}`);
       } else {
         try {
           await hs.createSpendItem(campaignId, {
             isoDate: ymd,
-            amountMinorUnits: amountMinor,
+            amountMajor,  // <<<<<< send decimal currency amount
             source: 'Bing Ads',
           });
-          console.log(`💷 spend: ${name} ${ymd} £${Number(spend).toFixed(2)} (created)`);
+          console.log(`💷 spend: ${name} ${ymd} £${amountMajor.toFixed(2)} (created)`);
           spendItems++;
         } catch (e) {
           console.log(`❌ Spend item failed for "${name}": ${e.message || e}`);
@@ -154,7 +155,7 @@ async function processDay(hs, ymd, { dryRun }) {
       }
     }
 
-    // Totals
+    // ----- Totals -----
     const addClicks = Number(clicks || 0);
     const addImps = Number(impressions || 0);
     const addConvs = Number(conversions || 0);
