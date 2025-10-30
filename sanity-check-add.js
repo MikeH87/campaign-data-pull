@@ -1,4 +1,4 @@
-// sanity-check-add.js
+// File: sanity-check-add.js
 require('dotenv').config();
 const { getHubspotClient } = require('./src/hubspotClient');
 
@@ -17,18 +17,24 @@ const { getHubspotClient } = require('./src/hubspotClient');
 
   const { id } = await hs.ensureCampaign(name);
   const before = await hs.getCampaignById(id);
+  const props = before.properties || {};
+  const keyClicks = process.env.HSPROP_TOTAL_CLICKS || 'total_clicks';
+  const keyImps   = process.env.HSPROP_TOTAL_IMPRESSIONS || 'total_impressions';
+  const keyConvs  = process.env.HSPROP_TOTAL_CONVERSIONS || 'total_conversions';
+
   console.log('BEFORE:', {
-    clicks: before.properties[process.env.HSPROP_TOTAL_CLICKS || 'total_clicks'] || 0,
-    imps: before.properties[process.env.HSPROP_TOTAL_IMPRESSIONS || 'total_impressions'] || 0,
-    convs: before.properties[process.env.HSPROP_TOTAL_CONVERSIONS || 'total_conversions'] || 0,
+    clicks: props[keyClicks] || 0,
+    imps: props[keyImps] || 0,
+    convs: props[keyConvs] || 0,
   });
 
   await hs.addDailyTotalsAccumulative(id, { clicks, impressions: imps, conversions: convs, dateISO: date });
 
   const after = await hs.getCampaignById(id);
+  const propsAfter = after.properties || {};
   console.log('AFTER:', {
-    clicks: after.properties[process.env.HSPROP_TOTAL_CLICKS || 'total_clicks'] || 0,
-    imps: after.properties[process.env.HSPROP_TOTAL_IMPRESSIONS || 'total_impressions'] || 0,
-    convs: after.properties[process.env.HSPROP_TOTAL_CONVERSIONS || 'total_conversions'] || 0,
+    clicks: propsAfter[keyClicks] || 0,
+    imps: propsAfter[keyImps] || 0,
+    convs: propsAfter[keyConvs] || 0,
   });
 })().catch(e => { console.error(e?.response?.data || e); process.exit(1); });

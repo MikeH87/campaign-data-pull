@@ -5,7 +5,7 @@ const axios = require('axios');
 const HUBSPOT_BASE = 'https://api.hubapi.com';
 const HS_TOKEN = process.env.HUBSPOT_PRIVATE_APP_TOKEN;
 
-// ---- property names (authoritative from .env, with safe defaults) ----
+// ---- property names (from .env, with safe defaults) ----
 const HSPROP_TOTAL_SPEND       = process.env.HSPROP_TOTAL_SPEND       || 'hs_spend_items_sum_amount';
 const HSPROP_TOTAL_CLICKS      = process.env.HSPROP_TOTAL_CLICKS      || 'total_clicks';
 const HSPROP_TOTAL_IMPRESSIONS = process.env.HSPROP_TOTAL_IMPRESSIONS || 'total_impressions';
@@ -89,10 +89,11 @@ async function ensureCampaign(name) {
 /* ------------------ Spend items ------------------ */
 
 async function createSpendItem(campaignId, { isoDate, amountMajor, source }) {
+  // 'order' must be stable per-day so duplicates are prevented
   const order = Number(new Date(isoDate).toISOString().slice(0, 10).replace(/-/g, ''));
   const body = {
     name: `${source || 'Ads'} ${isoDate}`,
-    amount: Number(amountMajor),
+    amount: Number(amountMajor), // in major units (e.g. GBP)
     order,
     date: toEpochMillis(isoDate),
   };
@@ -101,7 +102,7 @@ async function createSpendItem(campaignId, { isoDate, amountMajor, source }) {
     body,
     { headers: authHeaders(), validateStatus: () => true }
   );
-  if (r.status === 201 || r.status === 409) return r.data; // 409 = already exists for that order
+  if (r.status === 201 || r.status === 409) return r.data; // 409 = that order already exists
   throw new Error(`Create spend item failed (${r.status}) ${JSON.stringify(r.data)}`);
 }
 
@@ -145,11 +146,9 @@ async function addDailyTotalsAccumulative(campaignId, { clicks, impressions, con
     [HSPROP_TOTAL_CONVERSIONS]: cur.convs  + addConvs,
   };
 
-  // “Last seen” / housekeeping (optional, only if the env variables are present)
-  if (HSPROP_LAST_STATUS)       next[HSPROP_LAST_STATUS]       = 'OK';
-  if (HSPROP_LAST_BING_DATE)    next[HSPROP_LAST_BING_DATE]    = toEpochMillis(dateISO);
-  if (HSPROP_LAST_AVG_CPC && Number.isFinite(+clicks))         next[HSPROP_LAST_AVG_CPC] = `${clicks ? (toNum(clicks) ? (toNum(conversions) ? (toNum(conversions) === 0 ? '' : '') : '') : '')}`; // harmless no-op; leave empty if you prefer
-  if (HSPROP_LAST_CPL && Number.isFinite(+conversions))        next[HSPROP_LAST_CPL]     = `${conversions ? '' : ''}`; // harmless no-op; leave empty if you prefer
+  // “Last seen” / housekeeping (optional)
+  if (HSPROP_LAST_STATUS)    next[HSPROP_LAST_STATUS] = 'OK';
+  if (HSPROP_LAST_BING_DATE) next[HSPROP_LAST_BING_DATE] = toEpochMillis(dateISO);
 
   // Log what we'll write (helps catch property name mismatches)
   console.log('[HS] PATCH totals', {
