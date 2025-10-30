@@ -4,54 +4,65 @@ require('dotenv').config();
 const axios = require('axios');
 
 /**
- * ENV required:
- *  - TW_BEARER_TOKEN           (OAuth2 Bearer for Ads API v11)
- *  - TW_ACCOUNT_ID             (e.g. "18ce54mzwyl")
- *  - TW_TIMEOUT_MS             (optional)
+ * ENV supported (either naming works):
+ *  Preferred:
+ *    - TW_BEARER_TOKEN
+ *    - TW_ACCOUNT_ID                (e.g. "18ce54mzwyl")
+ *  Also accepted:
+ *    - TWITTER_BEARER_TOKEN
+ *    - TWITTER_ACCOUNT_ID
+ *
+ * Optional:
+ *    - TW_TIMEOUT_MS
  *
  * Notes:
- *  - This uses the v11 stats endpoint for campaigns with DAY granularity.
- *  - We fetch metrics: impressions, clicks, conversions (link_click or website_conversions depending on data),
- *    and spend (in MAJOR units).
+ *  - Uses Ads API v11 stats endpoint (granularity=DAY).
+ *  - Returns per-campaign rows with impressions, clicks, conversions, and spend (major units).
  */
 
-const {
-  TW_BEARER_TOKEN,
-  TW_ACCOUNT_ID,
-  TW_TIMEOUT_MS,
-} = process.env;
-
-const TIMEOUT = Number(TW_TIMEOUT_MS || 45000);
-if (!TW_BEARER_TOKEN || !TW_ACCOUNT_ID) {
-  // Don’t throw at import-time (so bing-only runs still work),
-  // but we will throw when called.
+function pickEnv(...keys) {
+  for (const k of keys) {
+    const v = process.env[k];
+    if (v && String(v).trim() !== '') return v;
+  }
+  return undefined;
 }
 
+const TW_BEARER_TOKEN = pickEnv('TW_BEARER_TOKEN', 'TWITTER_BEARER_TOKEN');
+const TW_ACCOUNT_ID   = pickEnv('TW_ACCOUNT_ID', 'TWITTER_ACCOUNT_ID');
+const TW_TIMEOUT_MS   = pickEnv('TW_TIMEOUT_MS');
+
+const TIMEOUT = Number(TW_TIMEOUT_MS || 45000);
+
 function authHeaders() {
-  if (!TW_BEARER_TOKEN) throw new Error('TW_BEARER_TOKEN missing');
+  if (!TW_BEARER_TOKEN) {
+    throw new Error(
+      'Twitter ads auth missing: set TW_BEARER_TOKEN (or TWITTER_BEARER_TOKEN) in .env'
+    );
+  }
   return { Authorization: `Bearer ${TW_BEARER_TOKEN}` };
 }
 
 /**
- * Convert micro currency (if returned) to major units.
- * Twitter Ads usually returns spend in micro currency.
+ * Convert micro currency to major units.
+ * Twitter Ads typically returns spend in micro units under billed_charge_local_micro.
+ * 1,000,000 micro = 1.00 major
  */
 function microToMajor(micro) {
   const n = Number(micro || 0);
-  return Math.round(n / 10000) / 100; // 1,000,000 micro = 1.00 major
-}
-
-function toISO(dateYMD) {
-  // just “YYYY-MM-DD”
-  return dateYMD;
+  // To avoid floating issues, do a two-step division.
+  return Math.round(n / 10000) / 100; // == n / 1_000_000 with 2dp rounding
 }
 
 /**
- * Fetch per-campaign metrics for a single day.
- * We request granularity=DAY and set start_time/end_time inclusive of the day (UTC).
+ * Fetch per-campaign metrics for a single day (UTC).
  */
 async function fetchDay(ymd) {
-  if (!TW_ACCOUNT_ID) throw new Error('TW_ACCOUNT_ID missing');
+  if (!TW_ACCOUNT_ID) {
+    throw new Error(
+      'Twitter ads account missing: set TW_ACCOUNT_ID (or TWITTER_ACCOUNT_ID) in .env'
+    );
+  }
   const start = `${ymd}T00:00:00Z`;
   const end   = `${ymd}T23:59:59Z`;
 
@@ -65,7 +76,13 @@ async function fetchDay(ymd) {
     metric_groups: 'ENGAGEMENT,BILLING,WEB_CONVERSIONS',
   };
 
-  const r = await axios.get(url, { headers: authHeaders(), params, timeout: TIMEOUT, validateStatus: () => true });
+  const r = await axios.get(url, {
+    headers: authHeaders(),
+    params,
+    timeout: TIMEOUT,
+    validateStatus: () => true
+  });
+
   if (r.status !== 200) {
     throw new Error(`Twitter stats failed: ${r.status} ${r.statusText} ${JSON.stringify(r.data)}`);
   }
@@ -78,6 +95,10 @@ function pick(metric, fallback = 0) {
   return v;
 }
 
+/**
+ * Normalise response -> array of rows:
+ * { date, campaignId, campaignName, impressions, clicks, conversions, spend }
+ */
 function normaliseCampaignRows(ymd, payload) {
   const rows = [];
   const list = payload?.data || [];
@@ -87,8 +108,8 @@ function normaliseCampaignRows(ymd, payload) {
 
     const impressions = pick(metrics.impressions);
     const clicks = pick(metrics.clicks);
-    // “conversions” can be varied; take website_conversions or follows with best-effort fallback
-    const conversions = pick(metrics.website_conversions, pick(metrics.qualified_impressions, 0));
+    // conservative conversion pick: website_conversions first, otherwise fallback to 0
+    const conversions = pick(metrics.website_conversions, 0);
 
     // spend often in micro currency under “billed_charge_local_micro”
     let spendMajor = 0;
