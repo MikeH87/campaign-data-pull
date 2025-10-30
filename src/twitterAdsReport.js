@@ -1,179 +1,118 @@
-// src/twitterAdsReport.js
-// Pull daily campaign-level metrics from Twitter (X) Ads API.
-// Returns rows shaped like msadsReport.getDailyCampaignRows so the rest of the pipeline can reuse it.
-//
-// ENV required:
-//   TWITTER_BEARER_TOKEN=...        (OAuth2 Bearer, Ads API enabled on the app)
-//   TWITTER_ACCOUNT_ID=...          (numeric account id, starts with "gq..." in API docs; here just the id string)
-// Optional:
-//   TWITTER_API_BASE=https://ads-api.twitter.com/13
-//   MSADS_DEBUG=1 to log
-
+// File: src/twitterAdsReport.js
+'use strict';
+require('dotenv').config();
 const axios = require('axios');
-const { DateTime } = require('luxon');
 
-const API_BASE = process.env.TWITTER_API_BASE || 'https://ads-api.twitter.com/13';
-const ACCOUNT_ID = process.env.TWITTER_ACCOUNT_ID;
-const BEARER = process.env.TWITTER_BEARER_TOKEN;
+/**
+ * ENV required:
+ *  - TW_BEARER_TOKEN           (OAuth2 Bearer for Ads API v11)
+ *  - TW_ACCOUNT_ID             (e.g. "18ce54mzwyl")
+ *  - TW_TIMEOUT_MS             (optional)
+ *
+ * Notes:
+ *  - This uses the v11 stats endpoint for campaigns with DAY granularity.
+ *  - We fetch metrics: impressions, clicks, conversions (link_click or website_conversions depending on data),
+ *    and spend (in MAJOR units).
+ */
 
-function dbg(...args) {
-  if (process.env.MSADS_DEBUG) console.log('[TWADS]', ...args);
+const {
+  TW_BEARER_TOKEN,
+  TW_ACCOUNT_ID,
+  TW_TIMEOUT_MS,
+} = process.env;
+
+const TIMEOUT = Number(TW_TIMEOUT_MS || 45000);
+if (!TW_BEARER_TOKEN || !TW_ACCOUNT_ID) {
+  // Don’t throw at import-time (so bing-only runs still work),
+  // but we will throw when called.
 }
 
 function authHeaders() {
-  if (!BEARER) throw new Error('Missing TWITTER_BEARER_TOKEN');
-  return { Authorization: `Bearer ${BEARER}` };
+  if (!TW_BEARER_TOKEN) throw new Error('TW_BEARER_TOKEN missing');
+  return { Authorization: `Bearer ${TW_BEARER_TOKEN}` };
 }
 
 /**
- * Shape output exactly like msadsReport.getDailyCampaignRows:
- * [
- *  {
- *    date: 'YYYY-MM-DD',
- *    campaignId: 'string',
- *    campaignName: 'string',
- *    campaign_status: 'Active'|'Paused'|... (best-effort),
- *    impressions: number,
- *    clicks: number,
- *    conversions: number,
- *    spend: number,            // in MAJOR units (GBP etc)
- *    average_cpc: number|null,
- *    all_cost_per_conversion: number|null
- *  }
- * ]
+ * Convert micro currency (if returned) to major units.
+ * Twitter Ads usually returns spend in micro currency.
  */
-async function getDailyCampaignRows(dateYMD) {
-  if (!ACCOUNT_ID) throw new Error('Missing TWITTER_ACCOUNT_ID');
+function microToMajor(micro) {
+  const n = Number(micro || 0);
+  return Math.round(n / 10000) / 100; // 1,000,000 micro = 1.00 major
+}
 
-  // Twitter Ads time window requires full iso; we’ll compute the London-local day window
-  const start = DateTime.fromISO(dateYMD, { zone: 'Europe/London' }).startOf('day');
-  const end   = start.endOf('day');
+function toISO(dateYMD) {
+  // just “YYYY-MM-DD”
+  return dateYMD;
+}
 
-  // Twitter metrics: we’ll request campaign entity metrics for 1 day
-  // Docs (v13 at time of writing): /stats/jobs/accounts/:account_id — but for simplicity and speed we use synchronous stats:
-  // GET /stats/accounts/:account_id
-  //   ?entity=CAMPAIGN
-  //   &entity_ids=all (we’ll discover via campaigns list)
-  //   &start_time=&end_time=
-  //   &granularity=DAY
-  //   &placement=ALL_ON_TWITTER
-  //   &metric_groups=ENGAGEMENT,BILLING,WEB_CONVERSION
-  //
-  // We fetch campaigns first so we can also map status + name.
+/**
+ * Fetch per-campaign metrics for a single day.
+ * We request granularity=DAY and set start_time/end_time inclusive of the day (UTC).
+ */
+async function fetchDay(ymd) {
+  if (!TW_ACCOUNT_ID) throw new Error('TW_ACCOUNT_ID missing');
+  const start = `${ymd}T00:00:00Z`;
+  const end   = `${ymd}T23:59:59Z`;
 
-  // 1) List campaigns (paged)
-  const campaigns = await listAllCampaigns();
-
-  if (campaigns.length === 0) return [];
-
-  const entityIds = campaigns.map(c => c.id).join(',');
+  const url = `https://ads-api.twitter.com/11/stats/accounts/${encodeURIComponent(TW_ACCOUNT_ID)}`;
   const params = {
     entity: 'CAMPAIGN',
-    entity_ids: entityIds,
-    start_time: start.toUTC().toISO(), // ISO 8601 UTC
-    end_time: end.toUTC().toISO(),
+    start_time: start,
+    end_time: end,
     granularity: 'DAY',
     placement: 'ALL_ON_TWITTER',
-    metric_groups: 'ENGAGEMENT,BILLING,WEB_CONVERSION' // clicks, impressions, billed_charge_local_micro etc.
+    metric_groups: 'ENGAGEMENT,BILLING,WEB_CONVERSIONS',
   };
 
-  dbg('Stats params', { start: params.start_time, end: params.end_time });
-
-  const statRes = await axios.get(
-    `${API_BASE}/stats/accounts/${encodeURIComponent(ACCOUNT_ID)}`,
-    { headers: authHeaders(), params, validateStatus: () => true }
-  );
-
-  if (statRes.status !== 200) {
-    throw new Error(`Twitter stats failed (${statRes.status}) ${JSON.stringify(statRes.data)}`);
+  const r = await axios.get(url, { headers: authHeaders(), params, timeout: TIMEOUT, validateStatus: () => true });
+  if (r.status !== 200) {
+    throw new Error(`Twitter stats failed: ${r.status} ${r.statusText} ${JSON.stringify(r.data)}`);
   }
+  return r.data; // { data: [...], ... }
+}
 
-  // Response has data for each entity id. We’ll reduce it to target date’s bucket.
-  // Spend comes as billed_charge_local_micro in micro (1e-6) of local currency; convert to MAJOR.
+function pick(metric, fallback = 0) {
+  if (!Array.isArray(metric) || metric.length === 0) return fallback;
+  const v = Number(metric[0]) || 0;
+  return v;
+}
+
+function normaliseCampaignRows(ymd, payload) {
   const rows = [];
+  const list = payload?.data || [];
+  for (const item of list) {
+    const name = item?.id_data?.[0]?.name || item?.id || '';
+    const metrics = item?.id_data?.[0]?.metrics || {};
 
-  for (const ent of statRes.data.data || []) {
-    const id = ent.id;
-    const camp = campaigns.find(c => c.id === id);
-    const name = camp?.name || id;
+    const impressions = pick(metrics.impressions);
+    const clicks = pick(metrics.clicks);
+    // “conversions” can be varied; take website_conversions or follows with best-effort fallback
+    const conversions = pick(metrics.website_conversions, pick(metrics.qualified_impressions, 0));
 
-    // metrics are arrays aligned to time series. We expect exactly one bucket for the day.
-    const getFirst = (path) => {
-      const arr = path?.[0];
-      // The API can return strings; coerce to number safely
-      if (arr == null) return 0;
-      const n = Number(arr);
-      return Number.isFinite(n) ? n : 0;
-    };
-
-    const impressions = getFirst(ent.metrics?.impressions);
-    const clicks      = getFirst(ent.metrics?.clicks);
-    const convs       = getFirst(ent.metrics?.promoted_conversions || ent.metrics?.website_conversions);
-    const micro       = getFirst(ent.metrics?.billed_charge_local_micro);
-    const spend       = Math.round((micro / 1_000_000) * 100) / 100; // to major, 2dp
-
-    const avgCpc = clicks > 0 ? Math.round((spend / clicks) * 100) / 100 : null;
-    const cpl    = convs > 0 ? Math.round((spend / convs) * 100) / 100 : null;
+    // spend often in micro currency under “billed_charge_local_micro”
+    let spendMajor = 0;
+    const micro = metrics.billed_charge_local_micro;
+    if (Array.isArray(micro) && micro.length) {
+      spendMajor = microToMajor(micro[0]);
+    }
 
     rows.push({
-      date: dateYMD,
-      campaignId: id,
+      date: ymd,
+      campaignId: item?.id || '',
       campaignName: name,
-      campaign_status: mapStatus(camp?.entity_status),
       impressions,
       clicks,
-      conversions: convs,
-      spend,
-      average_cpc: avgCpc,
-      all_cost_per_conversion: cpl
+      conversions,
+      spend: spendMajor,
     });
   }
-
-  dbg('TW rows', { isoDate: dateYMD, count: rows.length });
   return rows;
 }
 
-function mapStatus(s) {
-  // Twitter entity_status: ACTIVE, PAUSED, DELETED, DRAFT
-  switch (String(s || '').toUpperCase()) {
-    case 'ACTIVE': return 'Active';
-    case 'PAUSED': return 'Paused';
-    case 'DELETED': return 'Deleted';
-    case 'DRAFT': return 'Draft';
-    default: return 'Unknown';
-  }
+async function getDailyCampaignRows(isoDate) {
+  const data = await fetchDay(isoDate);
+  return normaliseCampaignRows(isoDate, data);
 }
 
-async function listAllCampaigns() {
-  const headers = authHeaders();
-  const out = [];
-  let cursor = undefined;
-
-  while (true) {
-    const params = {
-      with_deleted: false,
-      count: 200,
-    };
-    if (cursor) params.cursor = cursor;
-
-    const res = await axios.get(
-      `${API_BASE}/accounts/${encodeURIComponent(ACCOUNT_ID)}/campaigns`,
-      { headers, params, validateStatus: () => true }
-    );
-    if (res.status !== 200) {
-      throw new Error(`Twitter campaigns failed (${res.status}) ${JSON.stringify(res.data)}`);
-    }
-    const data = res.data?.data || [];
-    for (const c of data) out.push({ id: c.id, name: c.name, entity_status: c.entity_status });
-
-    const next = res.data?.next_cursor;
-    if (!next) break;
-    cursor = next;
-  }
-  dbg('campaigns', out.length);
-  return out;
-}
-
-module.exports = {
-  getDailyCampaignRows, // for parity with msadsReport
-};
+module.exports = { getDailyCampaignRows };
