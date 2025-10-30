@@ -1,195 +1,200 @@
-// src/hubspotClient.js
-require("dotenv").config();
-const axios = require("axios");
+// File: src/hubspotClient.js
+require('dotenv').config();
+const axios = require('axios');
 
-const HUBSPOT_TOKEN = process.env.HUBSPOT_PRIVATE_APP_TOKEN;
-if (!HUBSPOT_TOKEN) throw new Error("HUBSPOT_PRIVATE_APP_TOKEN missing in env");
+const HUBSPOT_BASE = 'https://api.hubapi.com';
+const HS_TOKEN = process.env.HUBSPOT_PRIVATE_APP_TOKEN;
 
-function createHubSpotClient() {
-  const instance = axios.create({
-    baseURL: "https://api.hubapi.com",
-    timeout: 20000,
-    headers: {
-      Authorization: `Bearer ${HUBSPOT_TOKEN}`,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-    maxRedirects: 5,
-    validateStatus: (s) => s < 500 || s === 429,
-  });
+// Custom property names (use the ones you’ve already set in HubSpot)
+const HSPROP_CLICK_TOTAL = process.env.HSPROP_CLICK_TOTAL || 'bing_click_total';
+const HSPROP_IMP_TOTAL   = process.env.HSPROP_IMP_TOTAL   || 'bing_impression_total';
+const HSPROP_CONV_TOTAL  = process.env.HSPROP_CONV_TOTAL  || 'bing_conversion_total';
+const HSPROP_LAST_STATUS = process.env.HSPROP_LAST_STATUS || 'bing_last_status';
+const HSPROP_LAST_PROCESSED = process.env.HSPROP_LAST_PROCESSED || 'bing_last_processed';
 
-  // Simple retry on 429/5xx with backoff
-  instance.interceptors.response.use(async (res) => {
-    if (res.status === 429 || res.status >= 500) {
-      const retryAfter = Number(res.headers["retry-after"] || 1);
-      await new Promise((r) => setTimeout(r, (retryAfter || 1) * 1000));
-      return instance.request(res.config);
-    }
-    return res;
-  });
-
-  return instance;
+function authHeaders() {
+  return {
+    Authorization: `Bearer ${HS_TOKEN}`,
+    'Content-Type': 'application/json',
+  };
 }
 
-/**
- * Robust exact-name finder:
- * 1) Try server-side filter (?name=...) and match hs_name exactly.
- * 2) If not found, paginate through all campaigns requesting hs_name property explicitly.
- */
-async function findCampaignByName(hs, exactName, pageLimit = 5000) {
-  // Attempt 1: server-side filter by name
-  try {
-    const res = await hs.get("/marketing/v3/campaigns", {
-      params: {
-        name: exactName,
-        limit: 100,
-        properties: "hs_name",
-      },
-    });
-    if (res.status === 200 && Array.isArray(res.data?.results)) {
-      const found = res.data.results.find(
-        (c) => c?.properties?.hs_name === exactName
-      );
-      if (found) return { id: found.id, ...found.properties };
-    }
-  } catch (_) {
-    // ignore and fall back to pagination
-  }
+function toEpochMillis(isoYmd) {
+  // Accepts "YYYY-MM-DD" (or full ISO). Returns epoch ms (number).
+  const d = new Date(isoYmd.length === 10 ? `${isoYmd}T00:00:00Z` : isoYmd);
+  return d.getTime();
+}
 
-  // Attempt 2: paginate everything (request hs_name explicitly)
-  const limit = 100;
+// -------------------- Marketing Campaigns (v3) --------------------
+
+async function listCampaignsPage(limit = 100, after = undefined) {
+  const url = new URL(`${HUBSPOT_BASE}/marketing/v3/campaigns`);
+  url.searchParams.set('limit', String(Math.max(1, Math.min(100, limit))));
+  if (after != null) url.searchParams.set('after', String(after));
+  const r = await axios.get(url.toString(), {
+    headers: authHeaders(),
+    validateStatus: () => true,
+  });
+  if (r.status !== 200) {
+    throw new Error(
+      `List campaigns failed (${r.status}) ${JSON.stringify(r.data)}`
+    );
+  }
+  return r.data; // { results: [...], paging?: { next: { after } } }
+}
+
+async function findCampaignByName(name) {
+  // Paginate client-side and match by hs_name exactly.
   let after = undefined;
-  let checked = 0;
-
   while (true) {
-    const params = { limit, properties: "hs_name" };
-    if (after) params.after = after;
+    const data = await listCampaignsPage(100, after);
+    const found = (data.results || []).find(c => {
+      const n = c?.properties?.hs_name || c?.properties?.name || '';
+      return n === name;
+    });
+    if (found) return found;
 
-    const res = await hs.get("/marketing/v3/campaigns", { params });
-    if (res.status !== 200) {
-      throw new Error(
-        `Campaign list failed: ${res.status} ${res.statusText} ${JSON.stringify(res.data)}`
-      );
+    after = data?.paging?.next?.after;
+    if (!after) return null;
+  }
+}
+
+async function getCampaignById(id) {
+  const url = `${HUBSPOT_BASE}/marketing/v3/campaigns/${id}`;
+  const r = await axios.get(url, { headers: authHeaders(), validateStatus: () => true });
+  if (r.status !== 200) {
+    throw new Error(
+      `Get campaign failed (${r.status}) ${JSON.stringify(r.data)}`
+    );
+  }
+  return r.data; // has .properties
+}
+
+async function createCampaign(name) {
+  // minimal required payload; custom status property optional
+  const body = {
+    properties: {
+      hs_name: name,
+      // If you keep a custom status/text flag:
+      [HSPROP_LAST_STATUS]: 'CREATED',
+    },
+  };
+  const url = `${HUBSPOT_BASE}/marketing/v3/campaigns`;
+  const r = await axios.post(url, body, { headers: authHeaders(), validateStatus: () => true });
+  if (r.status !== 201) {
+    throw new Error(
+      `Create campaign failed for "${name}" (${r.status}) ${JSON.stringify(r.data)}`
+    );
+  }
+  return r.data; // includes id
+}
+
+async function ensureCampaign(name) {
+  const existing = await findCampaignByName(name);
+  if (existing) return existing;
+  const created = await createCampaign(name);
+  return created;
+}
+
+// -------------------- Spend Items --------------------
+
+async function createSpendItem(campaignId, { isoDate, amountMinorUnits, source }) {
+  // HubSpot "spend item" requires name, amount, order.
+  // We'll build deterministic "order" from the date for idempotency.
+  const order = Number(new Date(isoDate).toISOString().slice(0,10).replace(/-/g,'')); // e.g., 20221105
+  const name = `${source || 'Bing Ads'} ${isoDate}`;
+  // amount expects a number (in minor currency units) and currency code from campaign’s currency.
+  const body = {
+    name,               // string
+    amount: amountMinorUnits, // integer cents/pence
+    order,              // integer
+    date: toEpochMillis(isoDate),
+  };
+  const url = `${HUBSPOT_BASE}/marketing/v3/campaigns/${campaignId}/spend`;
+  const r = await axios.post(url, body, { headers: authHeaders(), validateStatus: () => true });
+  if (r.status !== 201) {
+    throw new Error(
+      `Create spend item failed (${r.status}) ${JSON.stringify(r.data)}`
+    );
+  }
+  return r.data;
+}
+
+// -------------------- Totals Patch --------------------
+
+async function getTotals(campaignId) {
+  const data = await getCampaignById(campaignId);
+  const p = data?.properties || {};
+  const clicks = Number(p[HSPROP_CLICK_TOTAL] || 0);
+  const imps   = Number(p[HSPROP_IMP_TOTAL]   || 0);
+  const convs  = Number(p[HSPROP_CONV_TOTAL]  || 0);
+  return { clicks, imps, convs };
+}
+
+async function patchCampaignProperties(campaignId, props) {
+  // IMPORTANT: HubSpot expects primitives for values; NOT { value: x } objects.
+  // Also ensure numbers are passed as numbers/strings—both work, but we'll send strings.
+  const normalized = {};
+  for (const [k, v] of Object.entries(props)) {
+    // Convert numbers to string to avoid locale issues; epoch stays number if property is numeric.
+    if (k === HSPROP_LAST_PROCESSED) {
+      // must be a numeric "long"
+      normalized[k] = typeof v === 'number' ? v : Number(v);
+    } else {
+      normalized[k] = typeof v === 'number' ? String(v) : String(v);
     }
-
-    const list = Array.isArray(res.data?.results) ? res.data.results : [];
-    const found = list.find((c) => c?.properties?.hs_name === exactName);
-    if (found) return { id: found.id, ...found.properties };
-
-    checked += list.length;
-    if (checked >= pageLimit) return null; // safety cap
-
-    const next = res.data?.paging?.next?.after;
-    if (!next) return null;
-    after = next;
   }
-}
 
-/** Create campaign with hs_name */
-async function createCampaign(hs, hsName, businessUnitId = undefined) {
-  const body = { properties: { hs_name: hsName } };
-  if (businessUnitId) body.businessUnits = [{ id: Number(businessUnitId) }];
-  const res = await hs.post("/marketing/v3/campaigns", body);
-  if (res.status !== 201) {
+  const body = { properties: normalized };
+  const url = `${HUBSPOT_BASE}/marketing/v3/campaigns/${campaignId}`;
+  const r = await axios.patch(url, body, { headers: authHeaders(), validateStatus: () => true });
+  if (r.status !== 200) {
     throw new Error(
-      `Create campaign failed: ${res.status} ${res.statusText} ${JSON.stringify(res.data)}`
+      `PATCH ${campaignId} failed (${r.status}) ${JSON.stringify(r.data)}`
     );
   }
-  return { id: res.data.id, ...res.data.properties };
+  return r.data;
 }
 
-/** Read a campaign to get its current properties */
-async function getCampaign(hs, campaignId) {
-  const res = await hs.get(`/marketing/v3/campaigns/${encodeURIComponent(campaignId)}`);
-  if (res.status !== 200) {
-    throw new Error(
-      `Get campaign failed: ${res.status} ${res.statusText} ${JSON.stringify(res.data)}`
-    );
-  }
-  return { id: res.data.id, ...res.data.properties };
+async function addDailyTotals(campaignId, { clicks, impressions, conversions, dateISO }) {
+  // Read current
+  const current = await getTotals(campaignId);
+  const next = {
+    [HSPROP_CLICK_TOTAL]: current.clicks + Number(clicks || 0),
+    [HSPROP_IMP_TOTAL]:   current.imps   + Number(impressions || 0),
+    [HSPROP_CONV_TOTAL]:  current.convs  + Number(conversions || 0),
+    [HSPROP_LAST_STATUS]: 'OK',
+    [HSPROP_LAST_PROCESSED]: toEpochMillis(dateISO),
+  };
+  return patchCampaignProperties(campaignId, next);
 }
 
-/** PATCH properties */
-async function updateCampaign(hs, campaignId, properties) {
-  const res = await hs.patch(`/marketing/v3/campaigns/${encodeURIComponent(campaignId)}`, { properties });
-  if (res.status !== 200) {
-    throw new Error(
-      `Update campaign failed: ${res.status} ${res.statusText} ${JSON.stringify(res.data)}`
-    );
-  }
-  return { id: res.data.id, ...res.data.properties };
+// -------------------- Export --------------------
+
+function createHubspotClient() {
+  return {
+    ensureCampaign,
+    findCampaignByName,
+    createCampaign,
+    createSpendItem,
+    addDailyTotals,
+    patchCampaignProperties,
+    getCampaignById,
+  };
 }
 
-/** Budget/spend */
-async function getCampaignBudget(hs, campaignId) {
-  const res = await hs.get(`/marketing/v3/campaigns/${encodeURIComponent(campaignId)}/budget/totals`);
-  if (res.status !== 200) {
-    throw new Error(
-      `Get budget failed: ${res.status} ${res.statusText} ${JSON.stringify(res.data)}`
-    );
-  }
-  return res.data;
-}
-
-async function createSpendItem(hs, campaignId, { name, amount, description = "", order = 0 }) {
-  const res = await hs.post(`/marketing/v3/campaigns/${encodeURIComponent(campaignId)}/spend`, {
-    amount,
-    name,
-    description,
-    order,
-  });
-  if (res.status !== 201) {
-    throw new Error(
-      `Create spend item failed: ${res.status} ${res.statusText} ${JSON.stringify(res.data)}`
-    );
-  }
-  return res.data;
-}
-
-async function updateSpendItem(hs, campaignId, spendId, { name, amount, description = "", order }) {
-  const res = await hs.put(
-    `/marketing/v3/campaigns/${encodeURIComponent(campaignId)}/spend/${encodeURIComponent(spendId)}`,
-    { amount, name, description, ...(order != null ? { order } : {}) }
-  );
-  if (res.status !== 200) {
-    throw new Error(
-      `Update spend item failed: ${res.status} ${res.statusText} ${JSON.stringify(res.data)}`
-    );
-  }
-  return res.data;
-}
-
-/** Idempotent: one spend item per day by name */
-async function ensureDailySpendItem(hs, campaignId, { name, amount, description = "" }) {
-  const budget = await getCampaignBudget(hs, campaignId);
-  const existing = Array.isArray(budget.spendItems)
-    ? budget.spendItems.find((s) => s?.name === name)
-    : null;
-
-  if (!existing) {
-    await createSpendItem(hs, campaignId, { name, amount, description, order: 0 });
-    return { action: "created" };
-  }
-
-  const currentAmount = Number(existing.amount || 0);
-  if (Number.isFinite(currentAmount) && Math.abs(currentAmount - amount) < 0.0001) {
-    return { action: "unchanged" };
-  }
-
-  await updateSpendItem(hs, campaignId, existing.id, {
-    name,
-    amount,
-    description,
-    order: existing.order ?? 0,
-  });
-  return { action: "updated" };
+// Legacy helper for consumers using getHubspotClient()
+function getHubspotClient() {
+  return createHubspotClient();
 }
 
 module.exports = {
-  createHubSpotClient,
-  findCampaignByName,
-  createCampaign,
-  getCampaign,
-  updateCampaign,
-  ensureDailySpendItem,
+  createHubspotClient,
+  getHubspotClient,
+  // export property names in case other scripts log them
+  HSPROP_CLICK_TOTAL,
+  HSPROP_IMP_TOTAL,
+  HSPROP_CONV_TOTAL,
+  HSPROP_LAST_STATUS,
+  HSPROP_LAST_PROCESSED,
 };
