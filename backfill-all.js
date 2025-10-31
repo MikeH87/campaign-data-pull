@@ -5,7 +5,7 @@ const path = require('path');
 
 // Sources
 const { getDailyCampaignRows: getBingRows } = require('./src/msadsReport');
-const { getDailyCampaignRows: getTwitterRows } = require('./src/twitterAdsReport');
+const { getDailyCampaignRows: getTwitterRows } = require('./src/twitterAdsReport'); // safe even if you don't call it
 
 // HubSpot
 const { getHubspotClient } = require('./src/hubspotClient');
@@ -37,11 +37,13 @@ function* eachDate(fromYmd, toYmd) {
     yield t.toISOString().slice(0, 10);
   }
 }
+
 function toMajorUnits(amountFloat) {
   const n = Number(amountFloat || 0);
   return Math.round(n * 100) / 100;
 }
 
+// ---- campaign ensure (cached locally) ----
 async function ensureCampaignIdForName(hs, name, { dryRun }) {
   const map = getCampaignMap();
   const mappedId = map[name];
@@ -51,7 +53,7 @@ async function ensureCampaignIdForName(hs, name, { dryRun }) {
     try {
       await hs.getCampaignById(mappedId);
       return mappedId;
-    } catch { /* stale id */ }
+    } catch { /* stale id, fall through */ }
   }
 
   const found = await hs.findCampaignByName(name).catch(() => null);
@@ -67,6 +69,37 @@ async function ensureCampaignIdForName(hs, name, { dryRun }) {
   map[name] = id;
   saveCampaignMap(map);
   return id;
+}
+
+/**
+ * Totals accumulator so we don't rely on read-after-write consistency from HubSpot between days.
+ * Structure: totalsCache[campaignId] = { clicks: number, imps: number, convs: number, initialised: boolean }
+ */
+const totalsCache = Object.create(null);
+
+async function addTotalsWithCache(hs, campaignId, ymd, adds) {
+  if (!totalsCache[campaignId]) {
+    // Initialise once from HubSpot to get the baseline
+    const cur = await hs.getTotals(campaignId);
+    totalsCache[campaignId] = {
+      clicks: Number(cur.clicks || 0),
+      imps:   Number(cur.imps || 0),
+      convs:  Number(cur.convs || 0),
+      initialised: true,
+    };
+  }
+
+  const cache = totalsCache[campaignId];
+  cache.clicks += Number(adds.clicks || 0);
+  cache.imps   += Number(adds.impressions || 0);
+  cache.convs  += Number(adds.conversions || 0);
+
+  // Write the accumulated numbers directly (single PATCH per day per campaign).
+  await hs.setTotalsDirect(campaignId, {
+    clicks: cache.clicks,
+    impressions: cache.imps,
+    conversions: cache.convs,
+  }, ymd);
 }
 
 async function processDayForRows(hs, ymd, rows, { dryRun, spendSourceLabel }) {
@@ -89,8 +122,9 @@ async function processDayForRows(hs, ymd, rows, { dryRun, spendSourceLabel }) {
     // Spend
     const amountMajor = toMajorUnits(spend);
     if (amountMajor > 0) {
-      if (dryRun) console.log(`[DRY] spend ${name} ${ymd} £${amountMajor.toFixed(2)}`);
-      else {
+      if (dryRun) {
+        console.log(`[DRY] spend ${name} ${ymd} £${amountMajor.toFixed(2)}`);
+      } else {
         try {
           await hs.createSpendItem(campaignId, { isoDate: ymd, amountMajor, source: spendSourceLabel });
           console.log(`💷 spend: ${name} ${ymd} £${amountMajor.toFixed(2)} (created)`);
@@ -102,18 +136,18 @@ async function processDayForRows(hs, ymd, rows, { dryRun, spendSourceLabel }) {
       }
     }
 
-    // Totals (additive)
+    // Totals (additive via local accumulator)
     const addClicks = Number(clicks || 0);
-    const addImps = Number(impressions || 0);
-    const addConvs = Number(conversions || 0);
+    const addImps   = Number(impressions || 0);
+    const addConvs  = Number(conversions || 0);
 
     if (addClicks || addImps || addConvs) {
       if (dryRun) {
         console.log(`[DRY] totals ${name} +clicks ${addClicks} +imps ${addImps} +conv ${addConvs}`);
       } else {
         try {
-          await hs.addDailyTotalsAccumulative(campaignId, {
-            clicks: addClicks, impressions: addImps, conversions: addConvs, dateISO: ymd,
+          await addTotalsWithCache(hs, campaignId, ymd, {
+            clicks: addClicks, impressions: addImps, conversions: addConvs
           });
           console.log(`✅ totals: ${name} clicks+${addClicks} imps+${addImps} conv+${addConvs}`);
           totalsAdded++;

@@ -5,20 +5,15 @@ const axios = require('axios');
 const HUBSPOT_BASE = 'https://api.hubapi.com';
 const HS_TOKEN = process.env.HUBSPOT_PRIVATE_APP_TOKEN;
 
-// ----- Custom property names (MUST be writable custom props on HubSpot Campaign) -----
-const HSPROP_TOTAL_SPEND       = envOr('HSPROP_TOTAL_SPEND',       'hs_spend_items_sum_amount'); // HS built-in sum of spend items (read-only in UI, but OK to read)
-const HSPROP_TOTAL_CLICKS      = envOr('HSPROP_TOTAL_CLICKS',      'total_clicks');              // <-- your custom field (e.g. bing_click_total)
-const HSPROP_TOTAL_IMPRESSIONS = envOr('HSPROP_TOTAL_IMPRESSIONS', 'total_impressions');         // <-- your custom field (e.g. bing_impression_total)
-const HSPROP_TOTAL_CONVERSIONS = envOr('HSPROP_TOTAL_CONVERSIONS', 'total_conversions');         // <-- your custom field (e.g. bing_conversion_total)
-const HSPROP_LAST_AVG_CPC      = envOr('HSPROP_LAST_AVG_CPC',      'avg_cpc_last');              // optional
-const HSPROP_LAST_CPL          = envOr('HSPROP_LAST_CPL',          'cpl_last');                  // optional
-const HSPROP_LAST_STATUS       = envOr('HSPROP_LAST_STATUS',       'bing_last_status');          // optional
-const HSPROP_LAST_BING_DATE    = envOr('HSPROP_LAST_BING_DATE',    'bing_last_processed');       // optional
-
-function envOr(name, def) {
-  const v = process.env[name];
-  return (v && v.trim().length) ? v.trim() : def;
-}
+// ---- property names (from .env, with safe defaults) ----
+const HSPROP_TOTAL_SPEND       = process.env.HSPROP_TOTAL_SPEND       || 'hs_spend_items_sum_amount';
+const HSPROP_TOTAL_CLICKS      = process.env.HSPROP_TOTAL_CLICKS      || 'total_clicks';
+const HSPROP_TOTAL_IMPRESSIONS = process.env.HSPROP_TOTAL_IMPRESSIONS || 'total_impressions';
+const HSPROP_TOTAL_CONVERSIONS = process.env.HSPROP_TOTAL_CONVERSIONS || 'total_conversions';
+const HSPROP_LAST_AVG_CPC      = process.env.HSPROP_LAST_AVG_CPC      || 'avg_cpc_last';
+const HSPROP_LAST_CPL          = process.env.HSPROP_LAST_CPL          || 'cpl_last';
+const HSPROP_LAST_STATUS       = process.env.HSPROP_LAST_STATUS       || 'bing_last_status';
+const HSPROP_LAST_BING_DATE    = process.env.HSPROP_LAST_BING_DATE    || 'bing_last_processed';
 
 function authHeaders() {
   return {
@@ -38,18 +33,11 @@ function toNum(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
-// Log which props we’ll use (helps catch env mismatches)
-console.log('[HS] Totals props:', {
-  clicks: HSPROP_TOTAL_CLICKS,
-  imps:   HSPROP_TOTAL_IMPRESSIONS,
-  convs:  HSPROP_TOTAL_CONVERSIONS,
-});
-console.log('[HS] Last props:', {
-  status:     HSPROP_LAST_STATUS,
-  lastDate:   HSPROP_LAST_BING_DATE,
-  lastAvgCpc: HSPROP_LAST_AVG_CPC,
-  lastCpl:    HSPROP_LAST_CPL,
-});
+// ---- log which props are in play (runs once on require)
+console.log('[HS] Totals props:',
+  { clicks: HSPROP_TOTAL_CLICKS, imps: HSPROP_TOTAL_IMPRESSIONS, convs: HSPROP_TOTAL_CONVERSIONS });
+console.log('[HS] Last props:',
+  { status: HSPROP_LAST_STATUS, lastDate: HSPROP_LAST_BING_DATE, lastAvgCpc: HSPROP_LAST_AVG_CPC, lastCpl: HSPROP_LAST_CPL });
 
 /* ------------------ Campaign helpers ------------------ */
 
@@ -101,24 +89,24 @@ async function ensureCampaign(name) {
 /* ------------------ Spend items ------------------ */
 
 async function createSpendItem(campaignId, { isoDate, amountMajor, source }) {
-  // HubSpot requires unique "order" per spend item; use yyyymmdd as integer
+  // 'order' must be stable per-day so duplicates are prevented
   const order = Number(new Date(isoDate).toISOString().slice(0, 10).replace(/-/g, ''));
   const body = {
     name: `${source || 'Ads'} ${isoDate}`,
-    amount: Number(amountMajor),           // major units (e.g., 23.15)
+    amount: Number(amountMajor), // in major units (e.g. GBP)
     order,
-    date: toEpochMillis(isoDate),          // epoch ms for the date
+    date: toEpochMillis(isoDate),
   };
   const r = await axios.post(
     `${HUBSPOT_BASE}/marketing/v3/campaigns/${campaignId}/spend`,
     body,
     { headers: authHeaders(), validateStatus: () => true }
   );
-  if (r.status === 201 || r.status === 409) return r.data; // 409 means already exists for that order
+  if (r.status === 201 || r.status === 409) return r.data; // 409 = that order already exists
   throw new Error(`Create spend item failed (${r.status}) ${JSON.stringify(r.data)}`);
 }
 
-/* ------------------ Totals (additive) ------------------ */
+/* ------------------ Totals helpers ------------------ */
 
 async function patchCampaignProperties(campaignId, props) {
   const body = { properties: props };
@@ -142,43 +130,29 @@ async function getTotals(campaignId) {
 }
 
 /**
- * Add daily totals additively (never overwrite).
- * Reads the current HS totals, then adds the day’s numbers and PATCHes.
+ * Directly set totals to specific values (used with local accumulator),
+ * and keep the “last processed date” + status fields updated.
  */
-async function addDailyTotalsAccumulative(campaignId, { clicks, impressions, conversions, dateISO }) {
-  // read existing
-  const cur = await getTotals(campaignId);
-
-  // coerce increments
-  const addClicks = toNum(clicks);
-  const addImps   = toNum(impressions);
-  const addConvs  = toNum(conversions);
-
-  // compute new totals
-  const nextTotals = {
-    [HSPROP_TOTAL_CLICKS]:      cur.clicks + addClicks,
-    [HSPROP_TOTAL_IMPRESSIONS]: cur.imps   + addImps,
-    [HSPROP_TOTAL_CONVERSIONS]: cur.convs  + addConvs,
+async function setTotalsDirect(campaignId, { clicks, impressions, conversions }, dateISO) {
+  const props = {
+    [HSPROP_TOTAL_CLICKS]:      Number(clicks || 0),
+    [HSPROP_TOTAL_IMPRESSIONS]: Number(impressions || 0),
+    [HSPROP_TOTAL_CONVERSIONS]: Number(conversions || 0),
   };
+  if (HSPROP_LAST_STATUS)    props[HSPROP_LAST_STATUS] = 'OK';
+  if (HSPROP_LAST_BING_DATE) props[HSPROP_LAST_BING_DATE] = toEpochMillis(dateISO);
 
-  // housekeeping (optional)
-  const housekeeping = {};
-  if (HSPROP_LAST_STATUS)    housekeeping[HSPROP_LAST_STATUS]    = 'OK';
-  if (HSPROP_LAST_BING_DATE) housekeeping[HSPROP_LAST_BING_DATE] = toEpochMillis(dateISO);
-
-  const writeProps = { ...nextTotals, ...housekeeping };
-
-  // log what we’ll write (for debugging mismatches)
-  console.log('[HS] PATCH totals', {
+  // Helpful log to verify exactly what we’re writing on each step
+  console.log('[HS] PATCH totals (direct)', {
     id: campaignId,
     write: {
-      [HSPROP_TOTAL_CLICKS]: writeProps[HSPROP_TOTAL_CLICKS],
-      [HSPROP_TOTAL_IMPRESSIONS]: writeProps[HSPROP_TOTAL_IMPRESSIONS],
-      [HSPROP_TOTAL_CONVERSIONS]: writeProps[HSPROP_TOTAL_CONVERSIONS],
+      clicks: props[HSPROP_TOTAL_CLICKS],
+      imps:   props[HSPROP_TOTAL_IMPRESSIONS],
+      convs:  props[HSPROP_TOTAL_CONVERSIONS],
     }
   });
 
-  await patchCampaignProperties(campaignId, writeProps);
+  await patchCampaignProperties(campaignId, props);
   return true;
 }
 
@@ -186,7 +160,9 @@ function getHubspotClient() {
   return {
     ensureCampaign,
     createSpendItem,
-    addDailyTotalsAccumulative,
+    // expose both helpers so the driver can pick the most robust path
+    getTotals,
+    setTotalsDirect,
     findCampaignByName,
     getCampaignById,
   };
