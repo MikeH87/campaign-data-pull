@@ -6,10 +6,11 @@ const HUBSPOT_BASE = 'https://api.hubapi.com';
 const HS_TOKEN = process.env.HUBSPOT_PRIVATE_APP_TOKEN;
 
 // ---- property names (from .env, with safe defaults) ----
+// IMPORTANT: ensure these match your HubSpot custom properties
 const HSPROP_TOTAL_SPEND       = process.env.HSPROP_TOTAL_SPEND       || 'hs_spend_items_sum_amount';
-const HSPROP_TOTAL_CLICKS      = process.env.HSPROP_TOTAL_CLICKS      || 'total_clicks';
-const HSPROP_TOTAL_IMPRESSIONS = process.env.HSPROP_TOTAL_IMPRESSIONS || 'total_impressions';
-const HSPROP_TOTAL_CONVERSIONS = process.env.HSPROP_TOTAL_CONVERSIONS || 'total_conversions';
+const HSPROP_TOTAL_CLICKS      = process.env.HSPROP_TOTAL_CLICKS      || 'bing_click_total';
+const HSPROP_TOTAL_IMPRESSIONS = process.env.HSPROP_TOTAL_IMPRESSIONS || 'bing_impression_total';
+const HSPROP_TOTAL_CONVERSIONS = process.env.HSPROP_TOTAL_CONVERSIONS || 'bing_conversion_total';
 const HSPROP_LAST_AVG_CPC      = process.env.HSPROP_LAST_AVG_CPC      || 'avg_cpc_last';
 const HSPROP_LAST_CPL          = process.env.HSPROP_LAST_CPL          || 'cpl_last';
 const HSPROP_LAST_STATUS       = process.env.HSPROP_LAST_STATUS       || 'bing_last_status';
@@ -26,7 +27,6 @@ function toEpochMillis(isoYmd) {
   const d = new Date(isoYmd.length === 10 ? `${isoYmd}T00:00:00Z` : isoYmd);
   return d.getTime();
 }
-
 function toNum(v) {
   if (v === null || v === undefined || v === '') return 0;
   const n = Number(v);
@@ -34,10 +34,17 @@ function toNum(v) {
 }
 
 // ---- log which props are in play (runs once on require)
-console.log('[HS] Totals props:',
-  { clicks: HSPROP_TOTAL_CLICKS, imps: HSPROP_TOTAL_IMPRESSIONS, convs: HSPROP_TOTAL_CONVERSIONS });
-console.log('[HS] Last props:',
-  { status: HSPROP_LAST_STATUS, lastDate: HSPROP_LAST_BING_DATE, lastAvgCpc: HSPROP_LAST_AVG_CPC, lastCpl: HSPROP_LAST_CPL });
+console.log('[HS] Totals props:', {
+  clicks: HSPROP_TOTAL_CLICKS,
+  imps:   HSPROP_TOTAL_IMPRESSIONS,
+  convs:  HSPROP_TOTAL_CONVERSIONS
+});
+console.log('[HS] Last props:', {
+  status:    HSPROP_LAST_STATUS,
+  lastDate:  HSPROP_LAST_BING_DATE,
+  lastAvgCpc:HSPROP_LAST_AVG_CPC,
+  lastCpl:   HSPROP_LAST_CPL
+});
 
 /* ------------------ Campaign helpers ------------------ */
 
@@ -76,13 +83,26 @@ async function createCampaign(name) {
     headers: authHeaders(),
     validateStatus: () => true,
   });
-  if (r.status !== 201) throw new Error(`Create campaign failed (${r.status}) ${JSON.stringify(r.data)}`);
-  return r.data;
+
+  // Success
+  if (r.status === 201) return r.data;
+
+  // If it already exists (409), resolve by returning the existing one
+  if (r.status === 409) {
+    const existing = await findCampaignByName(name);
+    if (existing) return existing;
+    throw new Error(`Create campaign 409 but could not find "${name}" via list`);
+  }
+
+  throw new Error(`Create campaign failed (${r.status}) ${JSON.stringify(r.data)}`);
 }
 
 async function ensureCampaign(name) {
+  // Try find first
   const existing = await findCampaignByName(name);
   if (existing) return existing;
+
+  // Otherwise try create; if HubSpot returns 409, createCampaign() will re-find and return it
   return createCampaign(name);
 }
 
@@ -92,8 +112,8 @@ async function createSpendItem(campaignId, { isoDate, amountMajor, source }) {
   // 'order' must be stable per-day so duplicates are prevented
   const order = Number(new Date(isoDate).toISOString().slice(0, 10).replace(/-/g, ''));
   const body = {
-    name: `${source || 'Ads'} ${isoDate}`,
-    amount: Number(amountMajor), // in major units (e.g. GBP)
+    name: `${source || 'Bing'} ${isoDate}`,
+    amount: Number(amountMajor), // already in major units (e.g. GBP)
     order,
     date: toEpochMillis(isoDate),
   };
@@ -130,9 +150,31 @@ async function getTotals(campaignId) {
 }
 
 /**
- * Directly set totals to specific values (used with local accumulator),
- * and keep the “last processed date” + status fields updated.
+ * ADDITIVE write: reads current totals, adds the deltas, and PATCHes the result.
+ * Also stamps last processed date + status.
  */
+async function addTotals(campaignId, { clicks = 0, impressions = 0, conversions = 0 }, dateISO) {
+  const cur = await getTotals(campaignId);
+  const next = {
+    clicks: cur.clicks + toNum(clicks),
+    imps:   cur.imps   + toNum(impressions),
+    convs:  cur.convs  + toNum(conversions),
+  };
+
+  const props = {
+    [HSPROP_TOTAL_CLICKS]:      Number(next.clicks),
+    [HSPROP_TOTAL_IMPRESSIONS]: Number(next.imps),
+    [HSPROP_TOTAL_CONVERSIONS]: Number(next.convs),
+  };
+  if (HSPROP_LAST_STATUS)    props[HSPROP_LAST_STATUS] = 'OK';
+  if (HSPROP_LAST_BING_DATE) props[HSPROP_LAST_BING_DATE] = toEpochMillis(dateISO);
+
+  console.log('[HS] ADD totals', { id: campaignId, add: { clicks, impressions, conversions }, write: next });
+  await patchCampaignProperties(campaignId, props);
+  return true;
+}
+
+// (Kept for completeness; NOT used by our backfill driver)
 async function setTotalsDirect(campaignId, { clicks, impressions, conversions }, dateISO) {
   const props = {
     [HSPROP_TOTAL_CLICKS]:      Number(clicks || 0),
@@ -142,16 +184,7 @@ async function setTotalsDirect(campaignId, { clicks, impressions, conversions },
   if (HSPROP_LAST_STATUS)    props[HSPROP_LAST_STATUS] = 'OK';
   if (HSPROP_LAST_BING_DATE) props[HSPROP_LAST_BING_DATE] = toEpochMillis(dateISO);
 
-  // Helpful log to verify exactly what we’re writing on each step
-  console.log('[HS] PATCH totals (direct)', {
-    id: campaignId,
-    write: {
-      clicks: props[HSPROP_TOTAL_CLICKS],
-      imps:   props[HSPROP_TOTAL_IMPRESSIONS],
-      convs:  props[HSPROP_TOTAL_CONVERSIONS],
-    }
-  });
-
+  console.log('[HS] PATCH totals (direct)', { id: campaignId, write: props });
   await patchCampaignProperties(campaignId, props);
   return true;
 }
@@ -159,12 +192,12 @@ async function setTotalsDirect(campaignId, { clicks, impressions, conversions },
 function getHubspotClient() {
   return {
     ensureCampaign,
-    createSpendItem,
-    // expose both helpers so the driver can pick the most robust path
-    getTotals,
-    setTotalsDirect,
     findCampaignByName,
     getCampaignById,
+    createSpendItem,
+    getTotals,
+    addTotals,        // <— use this for additive updates
+    setTotalsDirect,  // (not used by driver)
   };
 }
 
