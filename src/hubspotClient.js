@@ -6,7 +6,6 @@ const HUBSPOT_BASE = 'https://api.hubapi.com';
 const HS_TOKEN = process.env.HUBSPOT_PRIVATE_APP_TOKEN;
 
 // ---- property names (from .env) ----
-// IMPORTANT: these must match your HubSpot custom props.
 const HSPROP_TOTAL_SPEND       = process.env.HSPROP_TOTAL_SPEND       || 'hs_spend_items_sum_amount';
 const HSPROP_TOTAL_CLICKS      = process.env.HSPROP_TOTAL_CLICKS      || 'bing_click_total';
 const HSPROP_TOTAL_IMPRESSIONS = process.env.HSPROP_TOTAL_IMPRESSIONS || 'bing_impression_total';
@@ -35,7 +34,7 @@ function toNum(v) {
 }
 const sleep = (ms) => new Promise(res => setTimeout(res, ms));
 
-// ---- log which props are active (once on require) ----
+// ---- log which props are active ----
 console.log('[HS] Totals props:', {
   clicks: HSPROP_TOTAL_CLICKS,
   imps:   HSPROP_TOTAL_IMPRESSIONS,
@@ -50,12 +49,14 @@ console.log('[HS] Last props:', {
 
 /* ------------------ Campaign helpers ------------------ */
 
-async function listCampaignsPage(limit = 100, after) {
-  // HubSpot allows 1..100; we clamp and page.
+async function listCampaignsPage(limit = 100, after, { archived = false } = {}) {
+  // Clamp limit to HubSpot’s allowed range 1..100
   const lim = Math.max(1, Math.min(100, Number(limit) || 100));
   const url = new URL(`${HUBSPOT_BASE}/marketing/v3/campaigns`);
   url.searchParams.set('limit', String(lim));
   if (after) url.searchParams.set('after', String(after));
+  // Some HubSpot resources support archived param; include it and try both ways.
+  url.searchParams.set('archived', archived ? 'true' : 'false');
 
   const r = await axios.get(url.toString(), {
     headers: authHeaders(),
@@ -67,23 +68,32 @@ async function listCampaignsPage(limit = 100, after) {
   return r.data;
 }
 
-async function findCampaignByName(name, { maxPages = 50 } = {}) {
-  // Paged scan; case-insensitive, trimmed compare for safety.
+async function findCampaignByNameOnce(name, { archived = false, maxPages = 50 } = {}) {
   let after;
   let pages = 0;
   const needle = String(name || '').trim().toLowerCase();
 
   while (pages < maxPages) {
-    const data = await listCampaignsPage(100, after);
+    const data = await listCampaignsPage(100, after, { archived });
     const found = (data.results || []).find(c => {
       const hsName = (c?.properties?.hs_name || '').trim().toLowerCase();
       return hsName === needle;
     });
     if (found) return found;
-
     after = data?.paging?.next?.after;
     pages += 1;
     if (!after) break;
+  }
+  return null;
+}
+
+async function findCampaignByName(name, { maxSweeps = 1, maxPages = 50 } = {}) {
+  // Try non-archived first, then archived. Repeat up to maxSweeps.
+  for (let sweep = 0; sweep < maxSweeps; sweep++) {
+    const live = await findCampaignByNameOnce(name, { archived: false, maxPages });
+    if (live) return live;
+    const archived = await findCampaignByNameOnce(name, { archived: true, maxPages });
+    if (archived) return archived;
   }
   return null;
 }
@@ -100,7 +110,6 @@ async function getCampaignById(id) {
 }
 
 async function createCampaign(name) {
-  // We keep creation minimal to avoid validation issues.
   const props = { hs_name: name };
   if (HSPROP_LAST_STATUS) props[HSPROP_LAST_STATUS] = 'CREATED';
 
@@ -109,31 +118,29 @@ async function createCampaign(name) {
     validateStatus: () => true,
   });
   if (r.status === 201) return r.data;
-  if (r.status === 409) {
-    // Name conflict means it already exists.
-    // Let caller handle the “find after conflict” flow.
-    const err = new Error(`Create campaign failed (${r.status}) ${JSON.stringify(r.data)}`);
-    err.status = 409;
-    throw err;
-  }
-  throw new Error(`Create campaign failed (${r.status}) ${JSON.stringify(r.data)}`);
+
+  const err = new Error(`Create campaign failed (${r.status}) ${JSON.stringify(r.data)}`);
+  err.status = r.status;
+  throw err;
 }
 
 async function ensureCampaign(name) {
-  // 1) Search first (cheap).
-  const pre = await findCampaignByName(name);
+  // 1) Try to find first (cheap)
+  const pre = await findCampaignByName(name, { maxSweeps: 1, maxPages: 50 });
   if (pre) return pre;
 
-  // 2) Try to create.
+  // 2) Try to create
   try {
     const created = await createCampaign(name);
     return created;
   } catch (e) {
-    // 3) If 409, re-search with retries (eventual consistency on the index).
+    // 3) If 409 (already exists), retry find with multiple sweeps & increasing delays
     if (e && e.status === 409) {
-      for (let i = 0; i < 6; i++) {
-        await sleep(800 + i * 250);
-        const again = await findCampaignByName(name);
+      const maxRetries = 15;            // ~45-60s total
+      for (let i = 0; i < maxRetries; i++) {
+        const delay = 1000 + i * 250;   // backoff
+        await sleep(delay);
+        const again = await findCampaignByName(name, { maxSweeps: 2, maxPages: 60 });
         if (again) return again;
       }
       throw new Error(`Create campaign 409 but could not find "${name}" via list after retries`);
@@ -145,11 +152,11 @@ async function ensureCampaign(name) {
 /* ------------------ Spend items ------------------ */
 
 async function createSpendItem(campaignId, { isoDate, amountMajor, source }) {
-  // 'order' stable per-day to dedupe (HubSpot prevents dupes by 'order')
+  // 'order' stable per-day to dedupe
   const order = Number(new Date(isoDate).toISOString().slice(0, 10).replace(/-/g, ''));
   const body = {
     name: `${source || 'Ads'} ${isoDate}`,
-    amount: Number(Number(amountMajor).toFixed(2)), // major units, e.g. GBP, locked to 2dp
+    amount: Number(Number(amountMajor).toFixed(2)), // major units, 2dp
     order,
     date: toEpochMillis(isoDate),
   };
@@ -186,10 +193,6 @@ async function getTotals(campaignId) {
   };
 }
 
-/**
- * Increment totals by DELTAS (additive).
- * Also stamps last status/date fields.
- */
 async function addTotals(campaignId, deltas, dateISO) {
   const current = await getTotals(campaignId);
   const next = {
@@ -206,7 +209,6 @@ async function addTotals(campaignId, deltas, dateISO) {
   if (HSPROP_LAST_STATUS)    props[HSPROP_LAST_STATUS] = 'OK';
   if (HSPROP_LAST_BING_DATE) props[HSPROP_LAST_BING_DATE] = toEpochMillis(dateISO);
 
-  // helpful log
   console.log('[HS] ADD totals', {
     id: campaignId,
     delta: {
@@ -225,9 +227,6 @@ async function addTotals(campaignId, deltas, dateISO) {
   return next;
 }
 
-/**
- * Direct set (not used by backfill, but exported for tooling).
- */
 async function setTotalsDirect(campaignId, totals, dateISO) {
   const props = {
     [HSPROP_TOTAL_CLICKS]:      Number(totals.clicks || 0),
