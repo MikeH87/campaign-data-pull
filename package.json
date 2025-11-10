@@ -4,16 +4,15 @@
   "private": true,
   "type": "commonjs",
   "scripts": {
-    "daily": "node daily-run.js",
-    "backfill-totals": "node recalc-totals-simple.js --from=%FROM% --to=%TO%",
-    "backfill-all": "node backfill-all.js --from=%FROM% --to=%TO%",
-    "add-day": "node add-totals-for-day.js --date=%DATE%",
-    "backfill-spend-day": "node backfill.js --date=%DATE%"
+    "render-build": "npm ci || npm install",
+    "start": "node run-bing-daily.js"
   },
   "dependencies": {
     "axios": "^1.7.7",
-    "csv-parse": "^5.5.6",
+    "big-integer": "^1.6.52",
+    "csv-parse": "^5.6.0",
     "dotenv": "^17.2.3",
-    "unzipper": "^0.10.14"
+    "unzipper": "^0.10.14",
+    "yargs": "^17.7.2"
   }
 }
