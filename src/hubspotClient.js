@@ -1,6 +1,4 @@
-# Overwrite src\hubspotClient.js with the full correct code
-@'
-require('dotenv').config();
+﻿require('dotenv').config();
 const axios = require('axios');
 
 const HUBSPOT_BASE = 'https://api.hubapi.com';
@@ -205,4 +203,3 @@ function getHubspotClient() {
 }
 
 module.exports = { getHubspotClient };
-'@ | Set-Content -Encoding UTF8 .\src\hubspotClient.js

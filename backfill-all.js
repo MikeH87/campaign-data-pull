@@ -1,6 +1,4 @@
-# Overwrite backfill-all.js with the full correct code
-@'
-require('dotenv').config();
+﻿require('dotenv').config();
 const yargs = require('yargs/yargs');
 const { hideBin } = require('yargs/helpers');
 
@@ -120,4 +118,3 @@ if (require.main === module) {
     process.exit(1);
   });
 }
-'@ | Set-Content -Encoding UTF8 .\backfill-all.js
