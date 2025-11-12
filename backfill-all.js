@@ -1,125 +1,110 @@
 // File: backfill-all.js
 require('dotenv').config();
-const yargs = require('yargs/yargs');
-const { hideBin } = require('yargs/helpers');
-
-const { getDailyCampaignRows } = require('./src/msadsReport');
+const { getDailyCampaignRows } = require('./src/msadsReport'); // Bing/MS Ads
 const { getHubspotClient } = require('./src/hubspotClient');
 
-function sleep(ms){ return new Promise(r => setTimeout(r, ms)); }
-function isYMD(s){ return /^\d{4}-\d{2}-\d{2}$/.test(s||''); }
-
-const argv = yargs(hideBin(process.argv))
-  .option('source', { type: 'string', default: 'bing' })
-  .option('from',   { type: 'string', demandOption: true })
-  .option('to',     { type: 'string', demandOption: true })
-  .option('dryRun', { type: 'boolean', default: false })
-  .parse();
-
-const DRY = !!argv.dryRun;
-const SRC = (argv.source || 'bing').toLowerCase();
-
-if (!isYMD(argv.from) || !isYMD(argv.to)) {
-  console.error('Use ISO dates: --from=YYYY-MM-DD --to=YYYY-MM-DD');
-  process.exit(1);
+function ymdRange(from, to) {
+  const out = [];
+  const d0 = new Date(`${from}T00:00:00Z`);
+  const d1 = new Date(`${to}T00:00:00Z`);
+  for (let d = d0; d <= d1; d.setUTCDate(d.getUTCDate() + 1)) {
+    out.push(d.toISOString().slice(0, 10));
+  }
+  return out;
 }
 
-function* dayRange(fromYMD, toYMD) {
-  const d0 = new Date(`${fromYMD}T00:00:00Z`);
-  const d1 = new Date(`${toYMD}T00:00:00Z`);
-  for (let d = new Date(d0); d <= d1; d.setUTCDate(d.getUTCDate()+1)) {
-    yield d.toISOString().slice(0,10);
-  }
-}
-
-async function ensureCampaignId(hs, name) {
-  // small retry on ensure, because hubspot can be eventually consistent
-  for (let i=0;i<4;i++){
-    try {
-      const c = await hs.ensureCampaign(name);
-      return c?.id;
-    } catch (e) {
-      const msg = (e && e.message) || String(e);
-      console.warn(`Ensure "${name}" attempt #${i+1} failed: ${msg}`);
-      await sleep(1000*(i+1));
-    }
-  }
-  throw new Error(`Ensure campaign failed for "${name}"`);
-}
-
-async function processDay(hs, isoDate) {
-  if (SRC !== 'bing') {
-    console.log(`Skipping ${isoDate} because source=${SRC}`);
-    return;
+async function processBingDay(hs, isoDate, dryRun) {
+  const rows = await getDailyCampaignRows(isoDate); // [{campaignName, spend, clicks, impressions, conversions, date}, ...]
+  if (!rows || !rows.length) {
+    console.log(`- ${isoDate}: no data`);
+    return { totalsAdded: 0, spendItems: 0 };
   }
 
-  const rows = await getDailyCampaignRows(isoDate); // [{campaignName, spend, clicks, impressions, conversions}, ...]
-  console.log(`[MSADS] Rows parsed { isoDate: '${isoDate}', count: ${rows.length} }`);
+  let totalsAdded = 0;
+  let spendItems = 0;
 
-  for (const row of rows) {
-    const name  = String(row.campaignName || '').trim();
-    const spend = Number(row.spend || 0);
-    const clicks= Number(row.clicks || 0);
-    const imps  = Number(row.impressions || 0);
-    const convs = Number(row.conversions || 0);
-
-    if (!name) continue;
+  for (const r of rows) {
+    const name = r.campaignName;
+    const spend = Number(r.spend || 0); // already major units (GBP)
+    const clicks = Number(r.clicks || 0);
+    const imps = Number(r.impressions || 0);
+    const convs = Number(r.conversions || 0);
 
     let campaignId;
     try {
-      campaignId = await ensureCampaignId(hs, name);
+      campaignId = await hs.ensureCampaignIdForName(name);
     } catch (e) {
-      console.error(`❌ Ensure campaign failed for "${name}": ${e.message || e}`);
+      console.error(`❌ Ensure campaign failed for "${name}": ${e.message}`);
       continue;
     }
 
-    // 1) Spend item (idempotent by order=YYYYMMDD)
+    // Spend item (idempotent via order)
     if (spend > 0) {
-      if (DRY) {
+      if (dryRun) {
         console.log(`[DRY] spend ${name} ${isoDate} £${spend.toFixed(2)}`);
       } else {
         try {
           await hs.createSpendItem(campaignId, { isoDate, amountMajor: spend, source: 'Bing' });
-          console.log(`💷 spend: ${name} ${isoDate} £${spend.toFixed(2)} (created/ok)`);
+          console.log(`💷 spend: ${name} ${isoDate} £${spend.toFixed(2)} (created or exists)`);
         } catch (e) {
-          console.error(`❌ Spend item failed for "${name}": ${e.message || e}`);
+          console.error(`❌ Spend item failed for "${name}": ${e.message}`);
         }
       }
+      spendItems++;
     }
 
-    // 2) Add totals (NOT overwrite)
+    // ADD totals (never overwrite)
     if (clicks || imps || convs) {
-      if (DRY) {
+      if (dryRun) {
         console.log(`[DRY] totals ${name} +clicks ${clicks} +imps ${imps} +conv ${convs}`);
       } else {
         try {
-          await hs.addTotals(campaignId, { addClicks: clicks, addImps: imps, addConvs: convs }, isoDate);
+          await hs.addTotalsDelta(campaignId, { clicks, impressions: imps, conversions: convs }, isoDate);
           console.log(`✅ totals: ${name} clicks+${clicks} imps+${imps} conv+${convs}`);
         } catch (e) {
-          console.error(`❌ Totals failed for "${name}": ${e.message || e}`);
+          console.error(`❌ Totals failed for "${name}": ${e.message}`);
         }
       }
+      totalsAdded++;
     }
   }
+
+  return { totalsAdded, spendItems };
 }
 
 async function main() {
-  console.log(`Backfill ALL (${SRC}) ${argv.from} → ${argv.to}${DRY ? ' [DRY RUN]' : ''}`);
+  const argv = require('yargs/yargs')(require('yargs/helpers').hideBin(process.argv))
+    .option('source', { type: 'string', default: 'bing' })
+    .option('from',   { type: 'string', demandOption: true })
+    .option('to',     { type: 'string', demandOption: true })
+    .option('dryRun', { type: 'boolean', default: false })
+    .argv;
+
+  const { source, from, to, dryRun } = argv;
   const hs = getHubspotClient();
 
-  let days = 0, spendItems = 0, totalsAdded = 0, failures = 0;
+  if (source !== 'bing') {
+    console.log(`Source "${source}" not supported in this run. Use --source=bing`);
+    return;
+  }
 
-  for (const ymd of dayRange(argv.from, argv.to)) {
+  console.log(`Backfill ALL (bing) ${from} → ${to}${dryRun ? ' [DRY RUN]' : ''}`);
+
+  const days = ymdRange(from, to);
+  let totals = 0, spends = 0, failures = 0;
+
+  for (const isoDate of days) {
     try {
-      await processDay(hs, ymd);
-      days++;
+      const r = await processBingDay(hs, isoDate, dryRun);
+      totals += r.totalsAdded;
+      spends += r.spendItems;
     } catch (e) {
       failures++;
-      console.error(`❌ Day ${ymd} failed: ${e.message || e}`);
+      console.error(`❌ Day ${isoDate} failed: ${e.message}`);
     }
   }
 
-  console.log(`Done. Days=${days} TotalsAdded=${totalsAdded} SpendItems=${spendItems} Failures=${failures} ${DRY ? '(DRY)' : ''}`);
+  console.log(`Done. Days=${days.length} TotalsAdded=${totals} SpendItems=${spends} Failures=${failures}${dryRun?' (DRY)':''}`);
 }
 
 if (require.main === module) {
