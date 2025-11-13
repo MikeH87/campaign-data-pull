@@ -1,5 +1,4 @@
-// File: src/hubspotClient.js
-require('dotenv').config();
+﻿require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
@@ -8,7 +7,6 @@ const HUBSPOT_BASE = 'https://api.hubapi.com';
 const HS_TOKEN = process.env.HUBSPOT_PRIVATE_APP_TOKEN;
 
 // ---- property names (from .env) ----
-// IMPORTANT: these must match your custom props in HubSpot
 const HSPROP_TOTAL_SPEND       = process.env.HSPROP_TOTAL_SPEND       || 'hs_spend_items_sum_amount';
 const HSPROP_TOTAL_CLICKS      = process.env.HSPROP_TOTAL_CLICKS      || 'bing_click_total';
 const HSPROP_TOTAL_IMPRESSIONS = process.env.HSPROP_TOTAL_IMPRESSIONS || 'bing_impression_total';
@@ -42,7 +40,6 @@ function sleep(ms) {
 }
 
 function toEpochMillis(isoYmd) {
-  // isoYmd "YYYY-MM-DD" or full ISO
   const d = new Date(isoYmd.length === 10 ? `${isoYmd}T00:00:00Z` : isoYmd);
   return d.getTime();
 }
@@ -132,7 +129,7 @@ async function getCampaignById(id) {
 }
 
 async function createCampaign(name) {
-  const body = { properties: { hs_name: name, ...(HSPROP_LAST_STATUS ? {[HSPROP_LAST_STATUS]:'CREATED'} : {}) } };
+  const body = { properties: { hs_name: name, ...(HSPROP_LAST_STATUS ? { [HSPROP_LAST_STATUS]: 'CREATED' } : {}) } };
   const r = await axios.post(`${HUBSPOT_BASE}/marketing/v3/campaigns`, body, {
     headers: authHeaders(),
     validateStatus: () => true,
@@ -163,7 +160,7 @@ async function ensureCampaignIdForName(name) {
   }
 
   // 2) try listing first (avoid unnecessary create)
-  const foundPre = await findCampaignByName(name);
+  const foundPre = await findCampaignByName(name, 50);
   if (foundPre?.id) {
     mapSetId(name, foundPre.id);
     return foundPre.id;
@@ -176,16 +173,22 @@ async function ensureCampaignIdForName(name) {
     return created.id;
   } catch (e) {
     if (e && e.status === 409) {
-      // 4) list a few times with backoff — the campaign exists already
+      // 4) name conflict: campaign exists (likely created elsewhere or concurrently)
       for (let i = 0; i < 6; i++) {
         await sleep(1000 + i * 500);
-        const found = await findCampaignByName(name, 25);
+        const found = await findCampaignByName(name, 50);
         if (found?.id) {
           mapSetId(name, found.id);
           return found.id;
         }
       }
-      throw new Error(`Create campaign 409 but could not find "${name}" via list after retries`);
+      console.warn(`[HS] After retries, performing full search for campaign "${name}"`);
+      const foundFull = await findCampaignByName(name, 1000);
+      if (foundFull?.id) {
+        mapSetId(name, foundFull.id);
+        return foundFull.id;
+      }
+      throw new Error(`Create campaign conflict: "${name}" not found after exhaustive search`);
     }
     throw e;
   }
